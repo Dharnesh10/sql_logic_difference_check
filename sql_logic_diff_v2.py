@@ -1,3 +1,42 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # SQL Logic Diff -- TSQL -> Firebird migration helper
+# MAGIC
+# MAGIC Compares a batch of "same-purpose" legacy T-SQL queries and tells you
+# MAGIC which ones are **logically identical** (so you can push a single
+# MAGIC Firebird rule id) vs which ones have a **real logic difference**
+# MAGIC (so you know to push a new rule/version), even when the SQL text
+# MAGIC differs only in predicate order, column order, whitespace, or case.
+# MAGIC
+# MAGIC **How to use this notebook:**
+# MAGIC 1. Run the "Install dependencies" cell, then run the
+# MAGIC    `dbutils.library.restartPython()` cell so the newly installed
+# MAGIC    package is picked up.
+# MAGIC 2. Run the "Library code" cell (defines all the comparison logic).
+# MAGIC 3. In the last section, edit the `SQL_FILE_PATH` variable to point at
+# MAGIC    your `.sql` file, then run that cell (and the ones after it) to
+# MAGIC    get the report.
+
+# COMMAND ----------
+
+# MAGIC %md ## 1. Install dependencies
+
+# COMMAND ----------
+
+# MAGIC %pip install sqlglot --quiet
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %md ## 2. Library code
+# MAGIC Run this cell once per session. It defines everything the comparison
+# MAGIC needs; nothing here needs editing.
+
+# COMMAND ----------
+
 #!/usr/bin/env python3
 """
 sql_logic_diff.py
@@ -33,31 +72,43 @@ CAVEATS (read before trusting the output blindly):
     the script does not attempt to resolve * against a real schema.
   - This is a static/textual-logic equivalence check. It cannot tell you
     two DIFFERENT-looking predicates are mathematically equivalent
-    (e.g. `a > 5` vs `NOT (a <= 5)`, or `a IN (1,2)` vs `a=1 OR a=2`)
-    unless you enable the optional --semantic flag which runs a light
-    canonicalization pass (De Morgan / IN-expansion) for a few common cases.
+    (e.g. `a > 5` vs `NOT (a <= 5)`, or `a IN (1,2)` vs `a=1 OR a=2`).
+    It DOES normalize away: predicate/column reordering, identifier case,
+    whitespace, comments, GROUP BY order, and symmetric comparisons
+    (a=b vs b=a).
   - It does not execute the queries or compare against real data. For a
     final sign-off you should still run both queries against a
     representative dataset and diff the result sets.
 
 USAGE:
-    Put each query in its own .sql file inside a folder, e.g.:
-        queries/query1.sql
-        queries/query2.sql
-        ...
-    Then run:
-        python3 sql_logic_diff.py --dir queries --dialect tsql --out report.md
+    Simplest case -- just point it at a .sql file with your queries,
+    each ending in a semicolon:
 
-    Or pass everything in one file, using "-- name: <name>" markers to
-    separate queries:
-        -- name: query1
+        python3 sql_logic_diff.py my_queries.sql
+
+    If the file has no query names, queries are auto-named query1,
+    query2, ... in the order they appear in the file. To control the
+    names (recommended), add a "-- name: <query_name>" comment line
+    right before each query:
+
+        -- name: high_value_customer_discount
         SELECT ...
         ;
-        -- name: query2
+        -- name: overdue_invoice_flag
         SELECT ...
         ;
-    Then run:
-        python3 sql_logic_diff.py --file all_queries.sql --dialect tsql
+
+    A results markdown report is written to sql_logic_report.md by
+    default (override with --out report.md).
+
+    You can also point it at a folder with one .sql file per query
+    (filename becomes the query name):
+
+        python3 sql_logic_diff.py queries/
+
+    Optional flags:
+        --dialect tsql      Source SQL dialect for parsing (default: tsql)
+        --out report.md     Where to write the markdown report
 """
 
 import argparse
@@ -77,25 +128,15 @@ from sqlglot import exp
 # 1. Loading queries
 # --------------------------------------------------------------------------
 
-def load_from_dir(path: str) -> Dict[str, str]:
-    queries = {}
-    for fname in sorted(os.listdir(path)):
-        if fname.lower().endswith(".sql"):
-            name = os.path.splitext(fname)[0]
-            with open(os.path.join(path, fname), "r", encoding="utf-8") as f:
-                queries[name] = f.read()
-    if not queries:
-        raise SystemExit(f"No .sql files found in {path}")
-    return queries
-
-
 NAME_MARKER_RE = re.compile(r"--\s*name:\s*(.+)", re.IGNORECASE)
 
 
-def load_from_single_file(path: str) -> Dict[str, str]:
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+def _has_name_markers(content: str) -> bool:
+    return bool(NAME_MARKER_RE.search(content))
 
+
+def load_from_marked_content(content: str) -> Dict[str, str]:
+    """Split a file that uses '-- name: <query_name>' comment markers."""
     queries: Dict[str, str] = {}
     current_name: Optional[str] = None
     buf: List[str] = []
@@ -115,12 +156,58 @@ def load_from_single_file(path: str) -> Dict[str, str]:
         else:
             buf.append(line)
     flush()
+    return queries
 
+
+def load_from_unmarked_content(content: str, dialect: str) -> Dict[str, str]:
+    """No '-- name:' markers found: split the file into individual
+    statements (on semicolons, dialect-aware) and auto-name them
+    query1, query2, ... in file order."""
+    statements = sqlglot.parse(content, read=dialect)
+    queries: Dict[str, str] = {}
+    idx = 0
+    for stmt in statements:
+        if stmt is None:
+            continue
+        idx += 1
+        queries[f"query{idx}"] = stmt.sql(dialect=dialect)
+    return queries
+
+
+def load_from_dir(path: str) -> Dict[str, str]:
+    queries = {}
+    for fname in sorted(os.listdir(path)):
+        if fname.lower().endswith(".sql"):
+            name = os.path.splitext(fname)[0]
+            with open(os.path.join(path, fname), "r", encoding="utf-8") as f:
+                queries[name] = f.read()
     if not queries:
-        raise SystemExit(
-            "No '-- name: <query_name>' markers found. "
-            "Either add them, or use --dir with one .sql file per query."
-        )
+        raise SystemExit(f"No .sql files found in {path}")
+    return queries
+
+
+def load_queries(path: str, dialect: str) -> Dict[str, str]:
+    """Main entry point: read one .sql file and return {query_name: sql}.
+
+    - If the file contains '-- name: <query_name>' markers, split on those.
+    - Otherwise, auto-split on statement boundaries and name them
+      query1, query2, ... in the order they appear in the file.
+    """
+    if os.path.isdir(path):
+        return load_from_dir(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if _has_name_markers(content):
+        queries = load_from_marked_content(content)
+        if queries:
+            return queries
+        # fall through to auto-split if markers existed but nothing parsed
+
+    queries = load_from_unmarked_content(content, dialect)
+    if not queries:
+        raise SystemExit(f"Could not find any SQL statements in {path}")
     return queries
 
 
@@ -443,32 +530,90 @@ def build_report(parsed: List[ParsedQuery]) -> str:
     return "\n".join(lines)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--dir", help="Folder containing one .sql file per query")
-    src.add_argument("--file", help="Single .sql file with '-- name: X' markers")
-    ap.add_argument("--dialect", default="tsql",
-                     help="Source SQL dialect for parsing (default: tsql)")
-    ap.add_argument("--out", default="sql_logic_report.md",
-                     help="Output report path (markdown)")
-    args = ap.parse_args()
+# COMMAND ----------
 
-    if args.dir:
-        queries = load_from_dir(args.dir)
-    else:
-        queries = load_from_single_file(args.file)
+# MAGIC %md ## 3. Set your SQL file path here and run
+# MAGIC
+# MAGIC Just edit the `SQL_FILE_PATH` variable below to point at your file,
+# MAGIC then run this cell. `SQL_FILE_PATH` can be:
+# MAGIC - a Unity Catalog Volume path, e.g. `/Volumes/my_catalog/my_schema/my_volume/queries.sql`
+# MAGIC - a DBFS path, e.g. `/dbfs/FileStore/queries.sql`
+# MAGIC - a workspace file path, e.g. `/Workspace/Users/you@company.com/queries.sql`
+# MAGIC
+# MAGIC Your file can either use `-- name: <query_name>` markers before each
+# MAGIC query, or just be plain queries separated by semicolons (they'll be
+# MAGIC auto-named query1, query2, ...).
 
-    parsed = parse_all(queries, args.dialect)
-    report = build_report(parsed)
+# COMMAND ----------
 
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(report)
+# ===== EDIT THIS =====
+SQL_FILE_PATH = "/Volumes/main/default/queries/queries.sql"
+DIALECT = "tsql"
+# ======================
 
-    print(f"Compared {len(parsed)} queries.")
-    print(f"Report written to: {args.out}")
+queries = load_queries(SQL_FILE_PATH, DIALECT)
+print(f"Loaded {len(queries)} queries: {', '.join(queries.keys())}")
 
+parsed = parse_all(queries, DIALECT)
+report_md = build_report(parsed)
 
-if __name__ == "__main__":
-    main()
+# COMMAND ----------
+
+# MAGIC %md ## 4. View the report
+# MAGIC Rendered inline below.
+
+# COMMAND ----------
+
+displayHTML(f"<pre style='white-space:pre-wrap;font-family:monospace'>{report_md}</pre>")
+
+# COMMAND ----------
+
+# MAGIC %md ## 5. (Optional) Save the report to a file
+# MAGIC Edit `OUTPUT_PATH` below if you want to save/share the report.
+
+# COMMAND ----------
+
+# ===== EDIT THIS =====
+OUTPUT_PATH = "/Volumes/main/default/queries/sql_logic_report.md"
+# ======================
+
+with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    f.write(report_md)
+
+print(f"Report written to: {OUTPUT_PATH}")
+
+# COMMAND ----------
+
+# MAGIC %md ## 6. (Optional) See the grouping as a table
+# MAGIC Handy if you want to filter/sort/export the summary rather than read
+# MAGIC the markdown.
+
+# COMMAND ----------
+
+import pandas as pd
+
+ok = [pq for pq in parsed if not pq.error]
+groups = group_by_logic(ok)
+ordered_hashes = []
+for pq in ok:
+    if pq.hash_ not in ordered_hashes:
+        ordered_hashes.append(pq.hash_)
+group_id_map = {h: f"RULE_{i+1}" for i, h in enumerate(ordered_hashes)}
+
+rows = []
+for pq in ok:
+    gid = group_id_map[pq.hash_]
+    members = [m.name for m in groups[pq.hash_]]
+    canonical_member = members[0]
+    is_canonical = pq.name == canonical_member
+    rows.append({
+        "query_name": pq.name,
+        "logic_group": gid,
+        "group_members": ", ".join(members),
+        "is_unique_logic": len(members) == 1,
+        "action": ("Push as new Firebird rule" if is_canonical or len(members) == 1
+                   else f"Reuse {gid} (same logic as {canonical_member})"),
+    })
+
+summary_df = pd.DataFrame(rows)
+display(spark.createDataFrame(summary_df))
